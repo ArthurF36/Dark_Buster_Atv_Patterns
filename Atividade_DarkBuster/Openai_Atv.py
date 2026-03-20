@@ -1,27 +1,26 @@
 import os
 import requests
 import json
+import pandas as pd
 
 # ============================================
 # CONFIGURAÇÃO DA API OPENAI
 # ============================================
-api_key = os.getenv("OPENAI_API_KEY")
+key = "OPENAI_API_KEY"
+api_key = os.getenv(key)
 
 if not api_key:
-    print("ERRO: OPENAI_API_KEY não encontrada!")
+    print(f"ERRO: {key} não encontrada!")
     exit(1)
 
-modelo = "gpt-4.1-mini"
+# Modelo atualizado (ex: gpt-4o ou gpt-4o-mini)
+modelo = "gpt-4o-mini" 
 endpoint = "https://api.openai.com/v1/chat/completions"
-
 headers = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {api_key}"
+    "Authorization": f"Bearer {api_key}",
+    "Content-Type": "application/json"
 }
 
-# ============================================
-# FUNÇÃO PARA BAIXAR HTML
-# ============================================
 def obter_html(url):
     try:
         resposta = requests.get(url, timeout=10)
@@ -31,135 +30,96 @@ def obter_html(url):
         print(f"Erro ao acessar {url}: {e}")
         return None
 
-
-# ============================================
-# FUNÇÃO PARA ANÁLISE COM JSON PADRÃO
-# ============================================
 def analisar_site(url):
     html = obter_html(url)
+    
+    resultado_padrao = {
+        "url": url,
+        "manipulative_design": False,
+        "patterns_detected": [],
+        "security_risks": [],
+        "confidence_level": "baixa"
+    }
 
-    # Se o HTML falhar, retornar JSON formal exigido pela atividade
     if not html:
-        fallback = {
-            "manipulative_design": False,
-            "patterns_detected": [],
-            "security_risks": [
-                "Não foi possível acessar o site ou o acesso foi bloqueado."
-            ],
-            "confidence_level": "baixa"
-        }
-        print(json.dumps(fallback, indent=2, ensure_ascii=False))
-        return
+        resultado_padrao["security_risks"] = ["Falha na conexão ou site inacessível."]
+        return resultado_padrao
 
-    print(f"HTML obtido com sucesso ({len(html)} caracteres).")
-
-    # Prompt no padrão exigido pelo PDF
     prompt = f"""
-Você deve analisar o HTML abaixo e responder SOMENTE com um JSON válido.
-
-Formato obrigatório:
+Analise o HTML e responda APENAS com um JSON válido seguindo este padrão estrito:
 {{
-  "manipulative_design": true/false,
-  "patterns_detected": [
-    {{
-      "name": "Nome do padrão",
-      "description": "Descrição curta"
-    }}
-  ],
-  "security_risks": [
-    "risco1",
-    "risco2"
-  ],
-  "confidence_level": "alta/média/baixa"
+    "url": "{url}",
+    "manipulative_design": boolean,
+    "patterns_detected": [{{ "name": "string", "description": "string" }}],
+    "security_risks": ["string"],
+    "confidence_level": "alta/média/baixa"
 }}
-
-REGRAS:
-- A resposta deve ser APENAS JSON.
-- Não use markdown.
-- Não coloque nada antes ou depois do JSON.
-- Não explique o resultado.
-
-HTML analisado:
-{html}
+HTML: {html[:15000]} 
 """
 
+    # ESTRUTURA OPENAI (Diferente do Gemini)
     payload = {
         "model": modelo,
         "messages": [
+            {"role": "system", "content": "Você é um analista de segurança e design ético. Responda apenas em JSON."},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0
+        "response_format": { "type": "json_object" } # Garante que venha JSON
     }
 
     try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=30)
-        print("Status da OpenAI:", response.status_code)
-
-        data = response.json()
-
-        # ===============================
-        # TRATAMENTO DE RATE LIMIT (429)
-        # ===============================
-        if response.status_code == 429:
-            erro_msg = data.get("error", {}).get("message", "").lower()
-
-            if "tokens per min" in erro_msg or "tpm" in erro_msg:
-                fallback = {
-                    "manipulative_design": False,
-                    "patterns_detected": [],
-                    "security_risks": [
-                        "A análise não pôde ser realizada porque o limite de tokens por minuto (TPM) da API OpenAI foi atingido."
-                    ],
-                    "confidence_level": "baixa"
-                }
-            else:
-                fallback = {
-                    "manipulative_design": False,
-                    "patterns_detected": [],
-                    "security_risks": [
-                        "A análise não pôde ser realizada devido ao limite de requisições da API (rate limit)."
-                    ],
-                    "confidence_level": "baixa"
-                }
-
-            print(json.dumps(fallback, indent=2, ensure_ascii=False))
-            return
-
-        # ===============================
-        # TRATAMENTO DE RESPOSTAS VÁLIDAS
-        # ===============================
-        if "choices" in data:
-            texto = data["choices"][0]["message"]["content"]
-
-            print("\nJSON final:\n")
-            print(texto)
-
-            # Verifica se o JSON é válido
-            try:
-                json.loads(texto)
-                print("\nJSON válido!")
-            except:
-                print("\nJSON inválido (IA pode ter quebrado o formato).")
-
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            # Acessando o conteúdo na estrutura OpenAI
+            texto_json = data["choices"][0]["message"]["content"].strip()
+            return json.loads(texto_json)
         else:
-            print("Resposta fora do padrão.")
-
+            resultado_padrao["security_risks"] = [f"Erro API OpenAI: {response.status_code}"]
+            return resultado_padrao
     except Exception as e:
-        print("ERRO ao enviar para OpenAI:", e)
-        fallback = {
-            "manipulative_design": False,
-            "patterns_detected": [],
-            "security_risks": [
-                "Erro inesperado ao chamar a API OpenAI."
-            ],
-            "confidence_level": "baixa"
-        }
-        print(json.dumps(fallback, indent=2, ensure_ascii=False))
-
+        resultado_padrao["security_risks"] = [f"Erro no processamento: {str(e)}"]
+        return resultado_padrao
 
 # ============================================
-# EXECUÇÃO
+# LOOP DE EXECUÇÃO E DATAFRAME
 # ============================================
 if __name__ == "__main__":
-    url = input("Digite a URL do site a ser analisado: ").strip()
-    analisar_site(url)
+    lista_resultados = []
+
+    print("--- Analisador de Sites (OpenAI) iniciado ---")
+
+    while True:
+        url_input = input("\nDigite a URL (ou '0' para encerrar): ").strip()
+
+        if url_input in ['0', 'sair', 'exit']:
+            break
+
+        if not url_input.startswith("http"):
+            print("Insira uma URL válida (ex: https://google.com)")
+            continue
+
+        print(f"🔍 Analisando com {modelo}: {url_input}...")
+        dados_analise = analisar_site(url_input)
+        
+        lista_resultados.append(dados_analise)
+        print("✅ Dados processados!")
+
+    if lista_resultados:
+        df_final = pd.DataFrame(lista_resultados)
+
+        pasta_resultados = "Data_resultados"
+        if not os.path.exists(pasta_resultados):
+            os.makedirs(pasta_resultados)
+
+        caminho_arquivo = os.path.join(pasta_resultados, 
+                                       "openai_manipulative_design.xlsx")
+        df_final.to_excel(caminho_arquivo, index=False, engine='openpyxl')
+        
+        print("\n" + "="*50)
+        print("RESULTADO NO DATAFRAME:")
+        print(df_final)
+        print(f"\n📁 Salvo em: {caminho_arquivo}")
+        print("="*50)
+    else:
+        print("\nNenhuma análise foi realizada.")
