@@ -3,6 +3,7 @@ import requests
 import json
 import pandas as pd
 from datetime import datetime
+from bs4 import BeautifulSoup  # Recomendado para limpar o HTML
 
 # ============================================
 # CONFIGURAÇÃO DA API GEMINI
@@ -13,20 +14,36 @@ api_key = os.getenv(API_KEY_NAME)
 if not api_key:
     raise ValueError(f"ERRO: variável de ambiente '{API_KEY_NAME}' não encontrada!")
 
-MODEL = "gemini-2.5-flash"
+# Atualizado para a versão estável mais recente
+MODEL = "gemini-1.5-flash" 
 ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
 
 # ============================================
-# FUNÇÃO: OBTER HTML
+# FUNÇÃO: OBTER E LIMPAR HTML
 # ============================================
 def obter_html(url):
     try:
+        # Headers mais robustos para evitar bloqueios (User-Agent de navegador real)
         headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; IA-Analyzer/1.0)"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.google.com/"
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        return response.text
+        
+        # Limpeza do HTML para focar no conteúdo e reduzir gasto de tokens
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Remove scripts e estilos que não ajudam na análise de design
+        for script_or_style in soup(["script", "style", "meta", "noscript", "link"]):
+            script_or_style.decompose()
+            
+        # Retorna apenas o corpo da página limpo
+        return str(soup.body)[:20000] # Limite de caracteres para segurança
+        
     except requests.exceptions.RequestException as e:
         print(f"[ERRO] Falha ao acessar {url}: {e}")
         return None
@@ -35,17 +52,22 @@ def obter_html(url):
 # FUNÇÃO: LIMPAR RESPOSTA DA IA
 # ============================================
 def limpar_json_resposta(texto):
-    if texto.startswith("```"):
-        texto = texto.replace("```json", "").replace("```", "").strip()
-    return texto
+    # Remove markdown de blocos de código se houver
+    if "```json" in texto:
+        texto = texto.split("```json")[1].split("```")[0].strip()
+    elif "```" in texto:
+        texto = texto.split("```")[1].split("```")[0].strip()
+    return texto.strip()
 
 # ============================================
 # FUNÇÃO: PROMPT
 # ============================================
 def construir_prompt(url, html):
     return f"""
-Analise o HTML e responda APENAS com um JSON válido seguindo este padrão estrito:
+Analise o HTML do site abaixo em busca de Deceptive Patterns (Dark Patterns) ou Design Persuasivo.
+URL: {url}
 
+Responda APENAS com um JSON válido:
 {{
     "url": "{url}",
     "manipulative_design": boolean,
@@ -56,7 +78,7 @@ Analise o HTML e responda APENAS com um JSON válido seguindo este padrão estri
             "name": "string",
             "category": "string",
             "description": "string",
-            "evidence": "trecho do HTML ou comportamento observado"
+            "evidence": "trecho do HTML ou elemento"
         }}
     ],
     "risk_level": "alto | medio | baixo",
@@ -64,16 +86,8 @@ Analise o HTML e responda APENAS com um JSON válido seguindo este padrão estri
     "confidence_level": "alta | media | baixa"
 }}
 
-REGRAS IMPORTANTES:
-- NÃO inventar padrões sem evidência
-- Se não houver padrões, retornar []
-- Basear-se apenas no HTML fornecido
-
-Exemplos de deceptive patterns:
-Roach Motel, Hidden Costs, Confirmshaming, Forced Continuity, Bait and Switch, Sneak into Basket
-
 HTML:
-{html[:15000]}
+{html}
 """
 
 # ============================================
@@ -94,34 +108,31 @@ def analisar_site(url):
     }
 
     if not html:
-        resultado_padrao["security_risks"] = ["Falha ao acessar o site"]
+        resultado_padrao["security_risks"] = ["Falha ao acessar o site ou bloqueio de bot"]
         return resultado_padrao
 
     prompt = construir_prompt(url, html)
 
     payload = {
-        "contents": [
-            {
-                "parts": [{"text": prompt}]
-            }
-        ]
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1, # Menor temperatura para respostas mais técnicas
+            "response_mime_type": "application/json" # Força a saída em JSON se o modelo suportar
+        }
     }
 
     try:
         response = requests.post(ENDPOINT, json=payload, timeout=30)
 
         if response.status_code != 200:
-            resultado_padrao["security_risks"] = [f"Erro API: {response.status_code}"]
+            resultado_padrao["security_risks"] = [f"Erro API: {response.status_code} - {response.text}"]
             return resultado_padrao
 
         data = response.json()
         texto = data["candidates"][0]["content"]["parts"][0]["text"]
-
-        texto = limpar_json_resposta(texto)
-
-        resultado = json.loads(texto)
-
-        return resultado
+        
+        texto_limpo = limpar_json_resposta(texto)
+        return json.loads(texto_limpo)
 
     except Exception as e:
         resultado_padrao["security_risks"] = [f"Erro processamento: {str(e)}"]
@@ -133,12 +144,9 @@ def analisar_site(url):
 def salvar_resultados(df):
     pasta = "Data_resultados"
     os.makedirs(pasta, exist_ok=True)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    caminho = os.path.join(pasta, f"analise_sites_gemini{timestamp}.xlsx")
-
+    caminho = os.path.join(pasta, f"analise_sites_{timestamp}.xlsx")
     df.to_excel(caminho, index=False, engine="openpyxl")
-
     print(f"\n📁 Resultados salvos em: {caminho}")
 
 # ============================================
@@ -146,39 +154,30 @@ def salvar_resultados(df):
 # ============================================
 def main():
     resultados = []
-
     print("\n=== ANALISADOR DE SITES (IA) ===")
+    print("Dica: Use URLs completas como https://www.ludoeducativo.com.br")
 
     while True:
         url = input("\nDigite uma URL (ou 'sair'): ").strip()
 
-        if url.lower() in ["sair", "exit", "0", "s", "S"]:
+        if url.lower() in ["sair", "exit", "s"]:
             break
 
         if not url.startswith("http"):
-            print("⚠️ URL inválida!")
-            continue
+            url = "https://" + url
 
-        print(f"🔍 Analisando: {url}")
-
+        print(f"🔍 Analisando: {url}...")
         resultado = analisar_site(url)
-
         resultados.append(resultado)
-
         print("✅ Análise concluída!")
 
     if resultados:
-        df = pd.DataFrame(resultados)
-
+        df = pd.json_normalize(resultados) # Melhor para converter JSON aninhado em tabela
         print("\n=== RESUMO ===")
-        print(df[["url", "design_classification", "risk_level", "confidence_level"]])
-
+        print(df[["url", "design_classification", "risk_level"]].to_string())
         salvar_resultados(df)
     else:
         print("Nenhuma análise realizada.")
 
-# ============================================
-# ENTRY POINT
-# ============================================
 if __name__ == "__main__":
     main()
